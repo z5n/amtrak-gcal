@@ -384,10 +384,21 @@ function handleAddToCalendar(card) {
       return;
     }
 
+    // Same-date header with a later arrival clock (e.g. 9:25 PM → 12:26 AM),
+    // or Dec 31 → Jan 1 parsed with the departure year.
+    if (end.getTime() <= start.getTime()) {
+      end = rollEndAfterStart(start, end);
+    }
+
+    const titleCities = parseTitleCities(title);
     const depCity =
-      extractSmartCardDepartsCity(card) || getFieldValue(card, "Departs");
+      extractSmartCardDepartsCity(card) ||
+      getFieldValue(card, "Departs") ||
+      titleCities?.from;
     const arrCity =
-      extractSmartCardArrivesCity(card) || getFieldValue(card, "Arrives");
+      extractSmartCardArrivesCity(card) ||
+      getFieldValue(card, "Arrives") ||
+      titleCities?.to;
     location = [depCity, arrCity].filter(Boolean).join(" → ");
   }
 
@@ -548,17 +559,77 @@ function extractHotelDetails(card) {
   return lines.join("\n");
 }
 
+function parseTitleCities(title) {
+  const cleaned = normalizeSpaces(title || "");
+  const m = cleaned.match(/^(.+?)\s+to\s+(.+)$/i);
+  if (!m) return null;
+  return { from: m[1].trim(), to: m[2].trim() };
+}
+
+function extractWhenLineText(card) {
+  const root = getCardRoot(card);
+  const el = card.querySelector(".s7IPpf") || root.querySelector(".s7IPpf");
+  return el?.textContent?.trim() || "";
+}
+
+function clocksFromWhenLine(raw) {
+  if (!raw) return { depClock: null, arrClock: null };
+  const times = Array.from(String(raw).matchAll(/(\d{1,2}:\d{2}\s*(?:AM|PM))/gi)).map(
+    m => m[0]
+  );
+  return {
+    depClock: times[0] || null,
+    arrClock: times[1] || null
+  };
+}
+
+function extractReservationNumber(card) {
+  const fromCard = extractAriaField(card, "Reservation number");
+  if (fromCard) return fromCard;
+
+  const scopes = [
+    card.closest(".eJPjde"),
+    card.closest("[role='main']"),
+    document.querySelector("[role='main']")
+  ].filter(Boolean);
+
+  for (const root of scopes) {
+    const el = root.querySelector("[aria-label^='Reservation number']");
+    if (!el) continue;
+    const label = el.getAttribute("aria-label") || "";
+    const value = label.replace(/^Reservation number,\s*/i, "").trim();
+    if (value) return value;
+  }
+
+  const main =
+    card.closest("[role='main']") ||
+    document.querySelector("[role='main']") ||
+    document.body;
+  const bodyText = main.querySelector?.(".a3s")?.textContent || main.textContent || "";
+  const m = bodyText.match(/Reservation Number\s*[-:]?\s*([A-Z0-9]+)/i);
+  return m ? m[1] : null;
+}
+
 function extractTravelDetails(card) {
-  const smartWhenLine = card.querySelector(".s7IPpf");
-  const depCity = extractSmartCardDepartsCity(card);
-  const arrCity = extractSmartCardArrivesCity(card);
-  const depTime = extractSmartCardDepartsTime(card);
-  const arrTime = extractSmartCardArrivesTime(card);
-  const resNum = extractAriaField(card, "Reservation number");
+  const whenRaw = extractWhenLineText(card);
+  const titleCities = parseTitleCities(extractTitle(card));
+  const clocks = clocksFromWhenLine(whenRaw);
+
+  const depCity = extractSmartCardDepartsCity(card) || titleCities?.from || null;
+  const arrCity = extractSmartCardArrivesCity(card) || titleCities?.to || null;
+
+  const depTime =
+    extractSmartCardDepartsTime(card) ||
+    (clocks.depClock ? `Departs at ${clocks.depClock}` : null);
+  const arrTime =
+    extractSmartCardArrivesTime(card) ||
+    (clocks.arrClock ? `Arrives at ${clocks.arrClock}` : null);
+
+  const resNum = extractReservationNumber(card);
 
   const smartLines = [];
-  if (smartWhenLine?.textContent?.trim()) {
-    smartLines.push(`When: ${smartWhenLine.textContent.trim()}`);
+  if (whenRaw) {
+    smartLines.push(`When: ${whenRaw}`);
   }
   if (depCity || depTime) {
     smartLines.push(`Departs: ${[depCity, depTime].filter(Boolean).join(" • ")}`);
@@ -691,27 +762,73 @@ function debounce(fn, waitMs) {
 }
 
 function extractSmartCardWhen(card) {
-  const line = card.querySelector(".s7IPpf");
+  const root = getCardRoot(card);
+  const line = card.querySelector(".s7IPpf") || root.querySelector(".s7IPpf");
   const raw = line?.textContent?.trim();
-  if (!raw) return null;
+  const fromHeader = raw ? parseSmartWhenLine(raw) : null;
+  if (fromHeader) return fromHeader;
 
-  const normalized = raw.replace(/\u202f/g, " ").replace(/\u00a0/g, " ");
+  return extractSmartCardWhenFromExpanded(card);
+}
+
+/**
+ * Same-day: "Sat, Dec 26 • 5:55 AM - 9:01 AM"
+ * Overnight / multi-day: "Sun, Dec 27 • 9:25 PM - Mon, Dec 28 • 12:26 AM"
+ */
+function parseSmartWhenLine(raw) {
+  const normalized = normalizeSpaces(raw);
   if (!normalized.includes("•")) return null;
 
-  const parts = normalized.split("•").map(s => s.trim());
-  if (parts.length < 2) return null;
-
-  const datePart = parts[0];
-  const timePart = parts.slice(1).join(" • ");
-  const m = timePart.match(
-    /(\d{1,2}:\d{2}\s?(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}\s?(?:AM|PM))/i
+  const overnight = normalized.match(
+    /^(.+?)\s*•\s*(\d{1,2}:\d{2}\s*(?:AM|PM))\s*-\s*(.+?)\s*•\s*(\d{1,2}:\d{2}\s*(?:AM|PM))$/i
   );
-  if (!m) return null;
+  if (overnight) {
+    return {
+      startText: `${overnight[1]}, ${overnight[2]}`,
+      endText: `${overnight[3]}, ${overnight[4]}`
+    };
+  }
+
+  const sameDay = normalized.match(
+    /^(.+?)\s*•\s*(\d{1,2}:\d{2}\s*(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}\s*(?:AM|PM))$/i
+  );
+  if (!sameDay) return null;
 
   return {
-    startText: `${datePart}, ${m[1]}`,
-    endText: `${datePart}, ${m[2]}`
+    startText: `${sameDay[1]}, ${sameDay[2]}`,
+    endText: `${sameDay[1]}, ${sameDay[3]}`
   };
+}
+
+/** Expanded card: "Departs at 9:25 PM" / "Arrives at 12:26 AM" plus dates from the when line. */
+function extractSmartCardWhenFromExpanded(card) {
+  const root = getCardRoot(card);
+  const line = (card.querySelector(".s7IPpf") || root.querySelector(".s7IPpf"))
+    ?.textContent;
+  const depTime = extractTimeFromLabel(extractSmartCardDepartsTime(card) || "");
+  const arrTime = extractTimeFromLabel(extractSmartCardArrivesTime(card) || "");
+  if (!line || !depTime || !arrTime) return null;
+
+  const dates = Array.from(
+    normalizeSpaces(line).matchAll(/[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2}/g)
+  ).map(m => m[0]);
+  if (!dates.length) return null;
+
+  return {
+    startText: `${dates[0]}, ${depTime}`,
+    endText: `${dates[1] || dates[0]}, ${arrTime}`
+  };
+}
+
+function rollEndAfterStart(start, end) {
+  const rolled = new Date(end.getTime());
+  const crossesNewYear =
+    start.getMonth() === 11 && rolled.getMonth() === 0;
+  if (crossesNewYear) {
+    rolled.setFullYear(start.getFullYear() + 1);
+    return rolled;
+  }
+  return new Date(end.getTime() + 24 * 60 * 60 * 1000);
 }
 
 function extractSmartCardDepartsCity(card) {
