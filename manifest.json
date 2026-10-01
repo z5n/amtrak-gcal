@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Gmail Travel → Google Calendar",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Adds a one-click button to Gmail travel cards to create Google Calendar events.",
     "permissions": [],
     "host_permissions": [

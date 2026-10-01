@@ -44,6 +44,9 @@ function scanForTravelCards() {
 
   // Emails without Gmail smart cards (raw Amtrak receipt only)
   scanForAmtrakReceipts();
+
+  // Hotel cancellation deadline → all-day reminder event
+  scanForHotelCancellationDeadlines();
 }
 
 function createAddButton(onClick, label) {
@@ -736,15 +739,199 @@ function formatForGCal(date) {
   );
 }
 
-function openGoogleCalendarEvent({ title, start, end, location, details }) {
+function formatForGCalAllDay(date) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`;
+}
+
+function openGoogleCalendarEvent({ title, start, end, location, details, allDay }) {
   const url = new URL("https://calendar.google.com/calendar/render");
   url.searchParams.set("action", "TEMPLATE");
   url.searchParams.set("text", title);
-  url.searchParams.set("dates", `${formatForGCal(start)}/${formatForGCal(end)}`);
+
+  if (allDay) {
+    // All-day events use exclusive end date (next day)
+    const endExclusive = new Date(end.getTime());
+    endExclusive.setDate(endExclusive.getDate() + 1);
+    url.searchParams.set(
+      "dates",
+      `${formatForGCalAllDay(start)}/${formatForGCalAllDay(endExclusive)}`
+    );
+  } else {
+    url.searchParams.set(
+      "dates",
+      `${formatForGCal(start)}/${formatForGCal(end)}`
+    );
+  }
+
   if (location) url.searchParams.set("location", location);
   if (details) url.searchParams.set("details", details);
 
   window.open(url.toString(), "_blank", "noopener");
+}
+
+/**
+ * Hilton (and similar) confirmation emails include:
+ * "If you wish to cancel, please do by 11:59 p.m. on Nov-24-2026, ..."
+ * Place an Add to Calendar button near that text for an all-day deadline event.
+ */
+function scanForHotelCancellationDeadlines() {
+  const bodies = document.querySelectorAll(".a3s");
+  bodies.forEach(body => {
+    if (body.querySelector("." + BUTTON_CLASS + "[data-cancel-deadline]")) return;
+
+    const deadline = parseHotelCancellationDeadline(body);
+    if (!deadline) return;
+
+    const host = findCancellationDeadlineHost(body, deadline.matchText);
+    if (!host || host.querySelector("." + BUTTON_CLASS + "[data-cancel-deadline]")) {
+      return;
+    }
+
+    log("found hotel cancellation deadline", deadline);
+
+    const btn = createAddButton(() => {
+      openGoogleCalendarEvent({
+        title: `DEADLINE TO CANCEL HOTEL - ${deadline.confirmation}`,
+        start: deadline.date,
+        end: deadline.date,
+        allDay: true,
+        details: [
+          `Cancel by: ${deadline.timeLabel}`,
+          deadline.confirmation
+            ? `Confirmation number: ${deadline.confirmation}`
+            : null,
+          deadline.rawLine || null
+        ]
+          .filter(Boolean)
+          .join("\n")
+      });
+    }, "Add Cancel Deadline");
+    btn.setAttribute("data-cancel-deadline", "1");
+    btn.style.marginLeft = "8px";
+    btn.style.marginTop = "4px";
+    btn.style.display = "inline-block";
+
+    host.appendChild(btn);
+  });
+}
+
+function parseHotelCancellationDeadline(body) {
+  const text = normalizeSpaces(body.innerText || body.textContent || "");
+
+  // "If you wish to cancel, please do by 11:59 p.m. on Nov-24-2026" (Hilton)
+  const m = text.match(
+    /If you wish to cancel[^.]*?\bdo by\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)\s+on\s+([A-Za-z]{3,9}-\d{1,2}-\d{4})/i
+  );
+  if (!m) return null;
+
+  const timeLabel = normalizeSpaces(m[1]).replace(/\./g, "");
+  const dateRaw = m[2]; // Nov-24-2026
+  const deadlineDate = parseHiltonDeadlineDate(dateRaw);
+  if (!deadlineDate) return null;
+
+  // Reminder fires the day before the stated cancel-by date
+  const date = new Date(deadlineDate.getTime());
+  date.setDate(date.getDate() - 1);
+
+  const confirmation =
+    extractConfirmationFromBody(body) ||
+    extractConfirmationFromNearbyCard(body) ||
+    "UNKNOWN";
+
+  // Reconstruct a readable match snippet for host lookup
+  const matchText = `do by ${m[1]} on ${m[2]}`;
+
+  return {
+    date,
+    timeLabel: normalizeClockLabel(timeLabel),
+    confirmation,
+    matchText,
+    rawLine: normalizeSpaces(m[0])
+  };
+}
+
+function parseHiltonDeadlineDate(raw) {
+  // "Nov-24-2026" or "November-24-2026"
+  const cleaned = String(raw || "").replace(/-/g, " ").trim();
+  const d = new Date(cleaned);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function normalizeClockLabel(timeLabel) {
+  const cleaned = normalizeSpaces(timeLabel)
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ");
+  const m = cleaned.match(/(\d{1,2}):(\d{2})\s*([ap]m)/i);
+  if (!m) return cleaned.toUpperCase();
+  return `${Number(m[1])}:${m[2]} ${m[3].toUpperCase()}`;
+}
+
+function extractConfirmationFromBody(body) {
+  const text = normalizeSpaces(body.innerText || body.textContent || "");
+  const patterns = [
+    /Confirmation\s*#\s*([A-Z0-9]+)/i,
+    /Confirmation\s*(?:number|no\.?|#)\s*[:.]?\s*([A-Z0-9]+)/i
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m?.[1]) return m[1];
+  }
+
+  // Hilton often wraps the number in a tel: link next to "Confirmation #"
+  const confLabel = Array.from(body.querySelectorAll("p, td, span, strong")).find(
+    el => /Confirmation\s*#/i.test(el.textContent || "")
+  );
+  if (confLabel) {
+    const tel = confLabel.querySelector('a[href^="tel:"]');
+    if (tel) {
+      const num = (tel.textContent || "").replace(/\D/g, "");
+      if (num) return num;
+    }
+    const m = normalizeSpaces(confLabel.textContent || "").match(
+      /Confirmation\s*#\s*([A-Z0-9]+)/i
+    );
+    if (m?.[1]) return m[1];
+  }
+
+  return null;
+}
+
+function extractConfirmationFromNearbyCard(body) {
+  const main = body.closest("[role='main']") || document;
+  const card = main.querySelector("div.mNKakd[data-card-id]");
+  if (!card) return null;
+  return extractAriaField(card, "Confirmation number");
+}
+
+function findCancellationDeadlineHost(body, matchText) {
+  // Prefer the <li> (or other block) that contains the cancel-by sentence
+  const candidates = body.querySelectorAll("li, p, td, span, div");
+  let best = null;
+  let bestLen = Infinity;
+
+  const needle = normalizeSpaces(matchText).toLowerCase();
+  for (const el of candidates) {
+    const t = normalizeSpaces(el.textContent || "").toLowerCase();
+    if (!t.includes(needle)) continue;
+    // Prefer the tightest element that still contains the phrase
+    if (t.length < bestLen) {
+      best = el;
+      bestLen = t.length;
+    }
+  }
+
+  if (best) return best;
+
+  // Fallback: Rate Rules / Cancellation Policy heading area
+  const headings = Array.from(body.querySelectorAll("h1, h2, h3, p, td"));
+  for (const h of headings) {
+    if (/cancellation policy/i.test(h.textContent || "")) {
+      return h.parentElement || h;
+    }
+  }
+
+  return body;
 }
 
 if (document.readyState === "loading") {
